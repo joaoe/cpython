@@ -1,5 +1,7 @@
 """Python part of the warnings subsystem."""
 
+import contextvars
+import threading
 import sys
 
 
@@ -10,6 +12,8 @@ __all__ = ["warn", "warn_explicit", "showwarning",
 def showwarning(message, category, filename, lineno, file=None, line=None):
     """Hook to write a warning to a file; replace if you like."""
     msg = WarningMessage(message, category, filename, lineno, file, line)
+    if _catch_message_global(msg):
+        return
     _showwarnmsg_impl(msg)
 
 def formatwarning(message, category, filename, lineno, line=None):
@@ -95,6 +99,8 @@ _showwarning_orig = showwarning
 
 def _showwarnmsg(msg):
     """Hook to write a warning to a file; replace if you like."""
+    if _catch_message_global(msg):
+        return
     try:
         sw = showwarning
     except NameError:
@@ -175,12 +181,41 @@ def simplefilter(action, category=Warning, lineno=0, append=False):
     assert action in ("error", "ignore", "always", "default", "module",
                       "once"), "invalid action: %r" % (action,)
     assert isinstance(lineno, int) and lineno >= 0, \
-           "lineno must be an int >= 0"
+           f"lineno {lineno} must be an int >= 0"
     _add_filter(action, None, category, None, lineno, append=append)
+
+
+class ProtectedListGlobal:
+    def __init__(self, obj):
+        self.lock = threading.RLock()
+        self.value = obj
+
+    def __enter__(self):
+        self.lock.__enter__()
+        return self.value
+
+    def __exit__(self, *a):
+        self.lock.__exit__(*a)
+
+
+class ProtectedListLocal:
+    def __init__(self, name, factory):
+        self.factory = factory
+        self.value = contextvars.ContextVar(name, default=None)
+
+    def __enter__(self):
+        if (stack := self.value.get()) is None:
+            self.value.set(stack := self.factory())
+            assert stack is not None
+        return stack
+
+    def __exit__(self, *a):
+        pass
 
 def _add_filter(*item, append):
     # Remove possible duplicate filters, so new one will be placed
     # in correct place. If append=True and duplicate exists, do nothing.
+    filters = get_filters()
     if not append:
         try:
             filters.remove(item)
@@ -194,7 +229,7 @@ def _add_filter(*item, append):
 
 def resetwarnings():
     """Clear the list of warning filters, so that no filters are active."""
-    filters[:] = []
+    get_filters()[:] = []
     _filters_mutated()
 
 class _OptionError(Exception):
@@ -363,7 +398,7 @@ def warn_explicit(message, category, filename, lineno,
     if registry.get(key):
         return
     # Search the filters
-    for item in filters:
+    for item in get_filters():
         action, msg, cat, mod, ln = item
         if ((msg is None or msg.match(text)) and
             issubclass(category, cat) and
@@ -437,33 +472,56 @@ class catch_warnings(object):
     """A context manager that copies and restores the warnings filter upon
     exiting the context.
 
-    The 'record' argument specifies whether warnings should be captured by a
-    custom implementation of warnings.showwarning() and be appended to a list
-    returned by the context manager. Otherwise None is returned by the context
-    manager. The objects appended to the list are arguments whose attributes
-    mirror the arguments to showwarning().
+    The 'record' argument specifies whether warnings should be captured and be
+    appended to a list returned by the context manager. Otherwise 'None' is
+    returned by the context manager. The objects appended to the list are of the
+    type 'warnings.WarningMessage'.
 
     The 'module' argument is to specify an alternative module to the module
     named 'warnings' and imported under that name. This argument is only useful
-    when testing the warnings module itself.
+    when testing the 'warnings' module itself.
 
-    If the 'action' argument is not None, the remaining arguments are passed
-    to warnings.simplefilter() as if it were called immediately on entering the
-    context.
+    If the 'action' argument is not 'None', the remaining arguments are passed
+    to 'warnings.simplefilter()' as if it were called immediately on entering
+    the context.
+
+    Multiple 'catch_warnings' can be created and enabled or entered
+    simultaneously in the same call chain. When a 'catch_warnings' is enabled
+    it goes to the top of a stack. The top-most 'catch_warnings' in the stack,
+    the latest one that was activated, will be the first to receive warnings
+    and may choose to handle the warning or ignore it so it is passed to the
+    next in the stack.
     """
 
+    GLOBAL_STACK = ProtectedListGlobal([])
+    LOCAL_STACK = ProtectedListLocal("catch_warnings_stack", list)
+
     def __init__(self, *, record=False, module=None,
-                 action=None, category=Warning, lineno=0, append=False):
+                 action=None, category=Warning, lineno=0, append=False,
+                 local=False):
         """Specify whether to record warnings and if an alternative module
         should be used other than sys.modules['warnings'].
 
         For compatibility with Python 3.0, please consider all arguments to be
         keyword-only.
 
+        Args:
+            ...
+            `local` controls whether to catch warnings for the local call stack
+            or globally. `local=False` is most useful for generic trap all
+            libraries like unit test suites and logging libraries, which most
+            likely want to catch all warnings globally. This is the historical
+            default behavior in Python. `local=True` is the new behavior that
+            traps warnings only for the current call stack, e.g., when running
+            inside an asyncio task or thread.
         """
         self._record = record
-        self._module = sys.modules['warnings'] if module is None else module
+        self._module = sys.modules[__name__] if module is None else module
         self._entered = False
+        self._filters = None
+        self._local = local
+        self._stack = self.LOCAL_STACK if local else self.GLOBAL_STACK
+        self._log = None
         if action is None:
             self._filter = None
         else:
@@ -473,39 +531,132 @@ class catch_warnings(object):
         args = []
         if self._record:
             args.append("record=True")
-        if self._module is not sys.modules['warnings']:
+        if self._module is not sys.modules[__name__]:
             args.append("module=%r" % self._module)
         name = type(self).__name__
         return "%s(%s)" % (name, ", ".join(args))
 
-    def __enter__(self):
-        if self._entered:
-            raise RuntimeError("Cannot enter %r twice" % self)
-        self._entered = True
-        self._filters = self._module.filters
-        self._module.filters = self._filters[:]
-        self._module._filters_mutated()
-        self._showwarning = self._module.showwarning
-        self._showwarnmsg_impl = self._module._showwarnmsg_impl
-        if self._filter is not None:
-            simplefilter(*self._filter)
-        if self._record:
-            log = []
-            self._module._showwarnmsg_impl = log.append
-            # Reset showwarning() to the default implementation to make sure
-            # that _showwarnmsg() calls _showwarnmsg_impl()
-            self._module.showwarning = self._module._showwarning_orig
-            return log
+    def is_enabled(self):
+        """Tells if this 'catch_warnings' is currently enabled.
+
+        'catch_warnings' can be enabled in a 'with' block or by calling
+        '.enable()'. 'catch_warnings' can be disabled when exiting a 'with'
+        block or by calling '.disable()'.
+
+        The return value of this method is not affected by 'record=True' or
+        'record=False'.
+        """
+        return self._entered
+
+    def toggle(self, value):
+        """Calls '.enable()' if 'value' is true else calls '.disable()'."""
+        if value:
+            return self.enable()
         else:
-            return None
+            return self.disable()
+
+    def __enter__(self):
+        """Enables this 'catch_warnings' with a ' with' block.
+
+        Returns a 'list' of strings, initially empty, which will be filled with
+        all catched warnings.
+        """
+        if self.is_enabled():
+            raise RuntimeError("Cannot enter %r twice" % self)
+        return self.enable()
+
+    def enable(self):
+        """Enables this 'catch_warnings' to receive warnings.
+
+        If this object was created with 'record=False', this methods sets up local
+        filters and returns.
+
+        If this object was created with 'record=True', the newly enabled
+        'catch_warnings' is pushed to the top of the 'catch_warnings' stack.
+        When receiving warnings, the stack is traversed from top to bottom,
+        until the message is consumed. If this 'catch_warnings' is enabled, this
+        call is a no-op.
+        """
+
+        if self.is_enabled():
+            return self._log
+
+        with self._stack as stack:
+            assert self not in stack  # Ensured by self.is_enabled() check
+            stack.append(self)
+
+            self._entered = True
+            self._filters = list(get_filters())
+            if self._filter is not None:
+                simplefilter(*self._filter)
+            if self._record:
+                self._log = []
+
+        return self._log
 
     def __exit__(self, *exc_info):
-        if not self._entered:
+        if not self.is_enabled():
             raise RuntimeError("Cannot exit %r without entering first" % self)
-        self._module.filters = self._filters
-        self._module._filters_mutated()
-        self._module.showwarning = self._showwarning
-        self._module._showwarnmsg_impl = self._showwarnmsg_impl
+        self.disable()
+
+    def disable(self):
+        """Disables this 'catch_warnings' so it won't receive warnings nor
+        filter messages.
+
+        This 'catch_warnings' is removed from the stack, even if it is not at
+        the top. If this 'catch_warnings' is disabled, this call is a no-op.
+        """
+
+        if not self.is_enabled():
+            return
+
+        with self._stack as stack:
+            self._log = None
+            self._filters = None
+            self._entered = False
+            self._module._filters_mutated()
+
+            assert stack and self in stack
+            stack.remove(self)
+
+    def log(self, message):
+        """Method that catches one message.
+
+        If this object is enabled and was created with 'record=True', the
+        'message' is appended to the '.messages' list and the method returns
+        'True'. Else it returns 'False' to tell the message was not captured.
+        """
+        if self.is_enabled() and self._log is not None:
+            self._log.append(message)
+            return True
+        return False
+
+    @classmethod
+    def acquire_stacks(cls):
+        for stack_lock in (cls.LOCAL_STACK, cls.GLOBAL_STACK):
+            with stack_lock as stack:
+                yield stack
+
+    messages = property(lambda self: self._log)
+    """Returns list with captured messages, if this object is enabled and was
+    created with 'record=True'. Else returns 'None'."""
+
+
+def _catch_message_global(message) -> bool:
+    for stack in catch_warnings.acquire_stacks():
+        for catcher in reversed(stack):
+            if catcher.log(message):
+                return True
+    return False
+
+
+def get_filters():
+    for stack in catch_warnings.acquire_stacks():
+        for catcher in reversed(stack):
+            if catcher.is_enabled() and catcher._filters is not None:
+                return catcher._filters
+
+    return filters  # The global
 
 
 _DEPRECATED_MSG = "{name!r} is deprecated and slated for removal in Python {remove}"
@@ -593,3 +744,25 @@ if not _warnings_defaults:
         simplefilter("ignore", category=ResourceWarning, append=1)
 
 del _warnings_defaults
+
+import types
+
+class Protect(types.ModuleType):
+    module = sys.modules[__name__]
+
+    def __init__(self):
+        super().__init__(__name__)
+
+    def __getattribute__(self, item):
+        return getattr(Protect.module, item)
+
+    def __setattr__(self, key, value):
+        if key in ("filters", "showwarning", "_showwarning_orig", "_showwarnmsg", "_showwarnmsg_impl", "warn", "warn_explicit"):
+            raise AttributeError(f"Read-only attribute {key}")
+        return setattr(Protect.module, key, value)
+
+    def __delattr__(self, key):
+        raise AttributeError(f"Read-only attribute {key}")
+
+
+sys.modules[__name__] = Protect()

@@ -39,13 +39,13 @@ def warnings_state(module):
     original_warnings = warning_tests.warnings
     original_filters = module.filters
     try:
-        module.filters = original_filters[:]
         module.simplefilter("once")
         warning_tests.warnings = module
         yield
     finally:
         warning_tests.warnings = original_warnings
-        module.filters = original_filters
+        assert module.filters is original_filters
+
 
 
 class TestWarning(Warning):
@@ -315,14 +315,17 @@ class FilterTests(BaseTest):
     def test_mutate_filter_list(self):
         class X:
             def match(self, a):
-                L[:] = []
+                self.module.get_filters()[:] = []
 
+        filter_copy = list(self.module.filters)
         L = [("default",X(),UserWarning,X(),0) for i in range(2)]
         with original_warnings.catch_warnings(record=True,
                 module=self.module) as w:
-            self.module.filters = L
+            self.module.get_filters()[:] = L
             self.module.warn_explicit(UserWarning("b"), None, "f.py", 42)
             self.assertEqual(str(w[-1].message), "b")
+
+        self.assertEqual(self.module.filters, filter_copy)
 
     def test_filterwarnings_duplicate_filters(self):
         with original_warnings.catch_warnings(module=self.module):
@@ -700,7 +703,7 @@ class _WarningsTests(BaseTest, unittest.TestCase):
             self.module.filterwarnings("error", "", Warning, "", 0)
             self.assertRaises(UserWarning, self.module.warn,
                                 'convert to error')
-            del self.module.filters
+            self.module.get_filters()[:] = []
             self.assertRaises(UserWarning, self.module.warn,
                                 'convert to error')
 
@@ -776,7 +779,9 @@ class _WarningsTests(BaseTest, unittest.TestCase):
         text = 'del showwarning test'
         with original_warnings.catch_warnings(module=self.module):
             self.module.filterwarnings("always", category=UserWarning)
-            del self.module.showwarning
+            with self.assertRaises(AttributeError):
+                del self.module.showwarning
+            self.assertTrue(self.module.showwarning)
             with support.captured_output('stderr') as stream:
                 self.module.warn(text)
                 result = stream.getvalue()
@@ -788,31 +793,24 @@ class _WarningsTests(BaseTest, unittest.TestCase):
         with original_warnings.catch_warnings(module=self.module):
             self.module.filterwarnings("always", category=UserWarning)
 
-            show = self.module._showwarnmsg
-            try:
+            with self.assertRaises(AttributeError):
                 del self.module._showwarnmsg
-                with support.captured_output('stderr') as stream:
-                    self.module.warn(text)
-                    result = stream.getvalue()
-            finally:
-                self.module._showwarnmsg = show
-        self.assertIn(text, result)
+            self.assertTrue(self.module._showwarnmsg)
 
-    def test_showwarning_not_callable(self):
-        with original_warnings.catch_warnings(module=self.module):
-            self.module.filterwarnings("always", category=UserWarning)
-            self.module.showwarning = print
-            with support.captured_output('stdout'):
-                self.module.warn('Warning!')
-            self.module.showwarning = 23
-            self.assertRaises(TypeError, self.module.warn, "Warning!")
+            with support.captured_output('stderr') as stream:
+                self.module.warn(text)
+                result = stream.getvalue()
+
+        self.assertIn(text, result)
 
     def test_show_warning_output(self):
         # With showwarning() missing, make sure that output is okay.
         text = 'test show_warning'
         with original_warnings.catch_warnings(module=self.module):
             self.module.filterwarnings("always", category=UserWarning)
-            del self.module.showwarning
+            with self.assertRaises(AttributeError):
+                del self.module.showwarning
+            self.assertTrue(self.module.showwarning)
             with support.captured_output('stderr') as stream:
                 warning_tests.inner(text)
                 result = stream.getvalue()
@@ -907,11 +905,11 @@ class _WarningsTests(BaseTest, unittest.TestCase):
         # bad warnings.filters or warnings.defaultaction.
         wmod = self.module
         with original_warnings.catch_warnings(module=wmod):
-            wmod.filters = [(None, None, Warning, None, 0)]
+            wmod.get_filters()[:] = [(None, None, Warning, None, 0)]
             with self.assertRaises(TypeError):
                 wmod.warn_explicit('foo', Warning, 'bar', 1)
 
-            wmod.filters = []
+            wmod.get_filters()[:] = []
             with support.swap_attr(wmod, 'defaultaction', None), \
                  self.assertRaises(TypeError):
                 wmod.warn_explicit('foo', Warning, 'bar', 1)
@@ -1051,14 +1049,20 @@ class CatchWarningTests(BaseTest):
         wmod = self.module
         orig_filters = wmod.filters
         orig_showwarning = wmod.showwarning
-        # Ensure both showwarning and filters are restored when recording
+        # Ensure both showwarning and filters are not modified
         with wmod.catch_warnings(module=wmod, record=True):
-            wmod.filters = wmod.showwarning = object()
+            with self.assertRaises(AttributeError):
+                wmod.filters = object()
+            with self.assertRaises(AttributeError):
+                wmod.showwarning = object()
         self.assertIs(wmod.filters, orig_filters)
         self.assertIs(wmod.showwarning, orig_showwarning)
         # Same test, but with recording disabled
         with wmod.catch_warnings(module=wmod, record=False):
-            wmod.filters = wmod.showwarning = object()
+            with self.assertRaises(AttributeError):
+                wmod.filters = object()
+            with self.assertRaises(AttributeError):
+                wmod.showwarning = object()
         self.assertIs(wmod.filters, orig_filters)
         self.assertIs(wmod.showwarning, orig_showwarning)
 
@@ -1104,14 +1108,14 @@ class CatchWarningTests(BaseTest):
         with wmod.catch_warnings(module=wmod) as w:
             self.assertIsNone(w)
             self.assertIs(wmod.showwarning, orig_showwarning)
-            self.assertIsNot(wmod.filters, orig_filters)
+            self.assertIs(wmod.filters, orig_filters)
         self.assertIs(wmod.filters, orig_filters)
         if wmod is sys.modules['warnings']:
             # Ensure the default module is this one
             with wmod.catch_warnings() as w:
                 self.assertIsNone(w)
                 self.assertIs(wmod.showwarning, orig_showwarning)
-                self.assertIsNot(wmod.filters, orig_filters)
+                self.assertIs(wmod.filters, orig_filters)
             self.assertIs(wmod.filters, orig_filters)
 
     def test_record_override_showwarning_before(self):
@@ -1125,15 +1129,11 @@ class CatchWarningTests(BaseTest):
             nonlocal my_log
             my_log.append(message)
 
-        # Override warnings.showwarning() before calling catch_warnings()
-        with support.swap_attr(wmod, 'showwarning', my_logger):
-            with wmod.catch_warnings(module=wmod, record=True) as log:
-                self.assertIsNot(wmod.showwarning, my_logger)
+        with wmod.catch_warnings(module=wmod, record=True) as log:
+            self.assertIsNot(wmod.showwarning, my_logger)
 
-                wmod.simplefilter("always")
-                wmod.warn(text)
-
-            self.assertIs(wmod.showwarning, my_logger)
+            wmod.simplefilter("always")
+            wmod.warn(text)
 
         self.assertEqual(len(log), 1, log)
         self.assertEqual(log[0].message.args[0], text)
@@ -1147,17 +1147,17 @@ class CatchWarningTests(BaseTest):
         my_log = []
 
         def my_logger(message, category, filename, lineno, file=None, line=None):
-            nonlocal my_log
             my_log.append(message)
 
         with wmod.catch_warnings(module=wmod, record=True) as log:
             wmod.simplefilter("always")
-            wmod.showwarning = my_logger
+            with self.assertRaises(AttributeError):
+                wmod.showwarning = my_logger
             wmod.warn(text)
 
-        self.assertEqual(len(my_log), 1, my_log)
-        self.assertEqual(my_log[0].args[0], text)
-        self.assertEqual(log, [])
+        self.assertEqual(len(log), 1, log)
+        self.assertEqual(log[0].message.args[0], text)
+        self.assertEqual(my_log, [])
 
     def test_check_warnings(self):
         # Explicit tests for the test.support convenience wrapper
@@ -1350,6 +1350,7 @@ class A:
         warn("test")
 
 a=A()
+a = None
         """
         rc, out, err = assert_python_ok("-c", code)
         self.assertEqual(err.decode().rstrip(),
